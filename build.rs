@@ -2,7 +2,7 @@ extern crate bindgen;
 
 use std::env;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use vcpkg;
 
@@ -49,7 +49,8 @@ fn find_tesseract_system_lib() -> Vec<String> {
 // we can use tesseract installed anywhere on Linux.
 // if you change install path(--prefix) to `configure` script.
 // set `export PKG_CONFIG_PATH=/path-to-lib/pkgconfig` before.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "freebsd"))]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(not(feature = "bundled"))]
 fn find_tesseract_system_lib() -> Vec<String> {
     let pk = pkg_config::Config::new()
         .atleast_version("4.1")
@@ -73,12 +74,7 @@ fn find_tesseract_system_lib() -> Vec<String> {
         .collect::<Vec<String>>()
 }
 
-#[cfg(all(
-    not(windows),
-    not(target_os = "macos"),
-    not(target_os = "linux"),
-    not(target_os = "freebsd")
-))]
+#[cfg(all(not(windows), not(target_os = "macos"), not(target_os = "linux")))]
 fn find_tesseract_system_lib() -> Vec<String> {
     println!("cargo:rustc-link-lib=tesseract");
     vec![]
@@ -109,14 +105,8 @@ fn capi_bindings(clang_extra_include: &[String]) -> bindgen::Bindings {
 fn public_types_bindings(clang_extra_include: &[String]) -> String {
     let mut public_types_bindings = bindgen::Builder::default()
         .header("wrapper_public_types.hpp")
-        .rustified_enum("tesseract::OcrEngineMode")
-        .rustified_enum("tesseract::Orientation")
-        .rustified_enum("tesseract::PageIteratorLevel")
-        .rustified_enum("tesseract::PageSegMode")
-        .rustified_enum("tesseract::ParagraphJustification")
-        .rustified_enum("tesseract::PolyBlockType")
-        .rustified_enum("tesseract::TextlineOrder")
-        .rustified_enum("tesseract::WritingDirection")
+        .allowlist_var("^k.*")
+        .allowlist_var("^tesseract::k.*")
         .blocklist_item("^kPolyBlockNames")
         .blocklist_item("^tesseract::kPolyBlockNames");
 
@@ -128,7 +118,98 @@ fn public_types_bindings(clang_extra_include: &[String]) -> String {
         .generate()
         .expect("Unable to generate public types bindings")
         .to_string()
-        .replace("tesseract_", "")
+        .replace("tesseract_k", "k")
+}
+
+#[cfg(all(feature = "bundled", target_os = "linux"))]
+fn find_tesseract_system_lib() -> Vec<String> {
+    use cmake::Config;
+    use std::process::Command;
+
+    const TESSERACT_VER: &str = "5.3.4";
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let tess_tgz = out_dir
+        .join(format!("tesseract-{}.tar.gz", TESSERACT_VER))
+        .into_os_string()
+        .into_string()
+        .unwrap();
+
+    let curl_status = Command::new("curl")
+        .current_dir(&out_dir)
+        .args([
+            "-z",
+            &format!("tesseract-{TESSERACT_VER}.tar.gz"),
+            "-RsSfL",
+            "--tlsv1.2",
+            &format!(
+                "https://github.com/tesseract-ocr/tesseract/archive/refs/tags/{TESSERACT_VER}.tar.gz"
+            ),
+            "-o",
+            &tess_tgz,
+        ])
+        .status()
+        .expect("failed to execute curl to download tesseract");
+    if !curl_status.success() {
+        panic!("failed to download tesseract");
+    }
+
+    let tar_status = Command::new("tar")
+        .current_dir(&out_dir)
+        .args(["-xzf", &tess_tgz])
+        .status()
+        .expect("failed to execute tar to unarchive tesseract");
+    if !tar_status.success() {
+        panic!("failed to unarchive tesseract");
+    }
+
+    let dst = Config::new(out_dir.join(format!("tesseract-{TESSERACT_VER}")))
+        .define("TESSDATA_PREFIX", find_tessdata_path())
+        .define(
+            "ENABLE_LTO",
+            if cfg!(not(debug_assertions)) {
+                "ON"
+            } else {
+                "OFF"
+            },
+        )
+        .define("ENABLE_NATIVE", "ON")
+        .define("DISABLE_LEGACY_ENGINE", "ON")
+        .define("BUILD_TRAINING_TOOLS", "OFF")
+        .define("BUILD_SHARED_LIBS", "OFF")
+        .define("OPENMP_BUILD", "OFF")
+        .define("GRAPHICS_DISABLE", "ON")
+        .define("DISABLE_ARCHIVE", "ON")
+        .define("DISABLE_CURL", "ON")
+        .build();
+
+    println!(
+        "cargo:rustc-link-search=native={}",
+        dst.join("lib").to_str().unwrap()
+    );
+    println!("cargo:rustc-link-lib=static=tesseract");
+    println!("cargo:rustc-link-lib=stdc++");
+
+    vec![dst.join("include").into_os_string().into_string().unwrap()]
+}
+
+#[allow(dead_code)]
+fn find_tessdata_path() -> String {
+    println!("cargo:rerun-if-env-changed=TESSDATA_PREFIX");
+    if let Ok(envvar) = env::var("TESSDATA_PREFIX") {
+        return envvar;
+    }
+    for p in [
+        "/usr/share/tessdata",
+        "/usr/share/tesseract/tessdata",
+        "/usr/share/tesseract-ocr/5/tessdata",
+    ] {
+        let path = Path::new(p);
+        if path.exists() {
+            return path.parent().unwrap().to_str().unwrap().to_owned();
+        };
+    }
+    panic!("Could not find tessdata directory, set the TESSDATA_PREFIX environment variable");
 }
 
 // MacOS clang is incompatible with Bindgen and constexpr
